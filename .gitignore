@@ -1,0 +1,9 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+*.log
+docs/dev-plans/
+tests/*-verification.json
+dist/*.bobplugin
+!dist/eudic-online-0.7.0.bobplugin

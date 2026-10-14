@@ -1,0 +1,11 @@
+{
+  "name": "bob-plugin-eudic-online",
+  "version": "0.7.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "verify:live": "node scripts/verify-live.js",
+    "verify:etymology": "node scripts/verify-etymology-live.js",
+    "pack": "node scripts/pack.js"
+  }
+}
