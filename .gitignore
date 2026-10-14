@@ -11,3 +11,4 @@ dist/*.bobplugin
 !dist/eudic-online-0.8.0.bobplugin
 
 !dist/eudic-online-0.8.1.bobplugin
+!dist/eudic-online-0.8.3.bobplugin

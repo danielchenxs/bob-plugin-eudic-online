@@ -13,7 +13,7 @@ const page = `<h2 class="word"><span class="word">hello</span><span class="affil
 <div id="TingLijuchild">${examples}</div>`;
 
 test('Bob 服务设置保留六个原生菜单并新增自动同步配置', () => {
-  assert.equal(info.version, '0.8.1');
+  assert.equal(info.version, '0.8.3');
   assert.deepEqual(info.options.map((item) => item.identifier), [
     'pronunciation', 'showEnglish', 'showEtymology', 'showForms', 'showPhrases', 'exampleCount',
     'autoAdd', 'eudicAuthorization', 'wordbookId'

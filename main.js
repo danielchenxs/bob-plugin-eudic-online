@@ -289,6 +289,17 @@ function isVerifiedBaseForm(html, candidate, word) {
   return !!identity && !identity.alias && listedInflection(identity.section, word);
 }
 
+function desktopCacheIdentity(html, word) {
+  var header = extractElement(html, "h1", "class", "explain-Word")
+    || extractElement(html, "h2", "class", "word");
+  if (header) {
+    var span = extractElement(header, "span", "class", "word");
+    var headword = htmlToPlainText(span || header).replace(/\s+/g, " ");
+    return isLookup(headword) && normalizeLookupWord(headword) === normalizeLookupWord(word);
+  }
+  return !!parseSuggestion(html, word);
+}
+
 function parsePhrases(html) {
   var section = extractElement(html, "div", "id", "SPECchild");
   var blocks = extractElements(section, "div", "id", "phrase", 6)
@@ -570,8 +581,7 @@ function cacheGet(kind, word) {
   if (!item) return null;
   if (Date.now() - item.time >= PUBLIC_TTL[kind]) { delete bucket[key]; return null; }
   if (kind === "wiki" && item.value.title.toLowerCase() !== key) { delete bucket[key]; return null; }
-  if (kind === "desktop" && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(item.value)
-    && !/<h2\b[^>]*class=["'][^"']*word/i.test(item.value)) { delete bucket[key]; return null; }
+  if (kind === "desktop" && !desktopCacheIdentity(item.value, word)) { delete bucket[key]; return null; }
   if (kind === "mobile") {
     if (!entryIdentity(item.value, word)) { delete bucket[key]; return null; }
   }
@@ -607,12 +617,12 @@ function cachePut(kind, word, value) {
 
 function requestPublic(kind, word, timeout, cancelSignal, callback, isActive) {
   var saved = cacheGet(kind, word);
-  if (saved) { callback(saved); return; }
+  if (saved) { callback(saved, true); return; }
   var url = kind === "mobile" ? MOBILE_URL + encodeURIComponent(word)
     : kind === "desktop" ? DICTIONARY_URL + encodeURIComponent(word)
       : WIKTIONARY_API + encodeURIComponent(word.toLowerCase());
   var once = false;
-  function complete(value) { if (once) return; once = true; callback(value); }
+  function complete(value) { if (once) return; once = true; callback(value, false); }
   try { $http.request({
     method: "GET", url: url, header: { "Accept": kind === "wiki" ? "application/json" : "text/html" },
     timeout: timeout, cancelSignal: cancelSignal,
@@ -628,8 +638,7 @@ function requestPublic(kind, word, timeout, cancelSignal, callback, isActive) {
       if (kind === "mobile" && value) {
         if (!entryIdentity(value, word)) cacheable = false;
       }
-      if (kind === "desktop" && value && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(value)
-        && !/<h2\b[^>]*class=["'][^"']*word/i.test(value)) cacheable = false;
+      if (kind === "desktop" && value && !desktopCacheIdentity(value, word)) cacheable = false;
       if (cacheable && kind !== "mobile") cachePut(kind, word, value);
       complete(value);
     }
@@ -905,7 +914,7 @@ function translate(query, completion) {
     return;
   }
   if (!active()) return;
-  requestPublic("mobile", word, 15, signal, function (html) {
+  requestPublic("mobile", word, 15, signal, function (html, fromCache) {
     if (!active()) return;
     if (!html) { finish({ error: { type: "network", message: "欧路词典连接失败或返回异常" } }); return; }
     var result;
@@ -919,7 +928,7 @@ function translate(query, completion) {
       catch (ignored) { /* Bob 仍会收到最终结果 */ }
     }
     if (!active()) return;
-    cachePut("mobile", word, html);
+    if (!fromCache) cachePut("mobile", word, html);
     var pending = 0;
     var started = false;
     var suggestion = "";
@@ -952,13 +961,13 @@ function translate(query, completion) {
         try { suggestion = desktop ? parseSuggestion(desktop, word) : ""; }
         catch (ignored) { suggestion = ""; }
         if (!suggestion) { formsDone(); return; }
-        requestPublic("mobile", suggestion, 3, signal, function (candidate) {
+        requestPublic("mobile", suggestion, 3, signal, function (candidate, candidateFromCache) {
           if (!active()) return;
           var verified = false;
           try { verified = !!candidate && isVerifiedBaseForm(candidate, suggestion, word); }
           catch (ignored) { verified = false; }
           if (verified) {
-            cachePut("mobile", suggestion, candidate);
+            if (!candidateFromCache) cachePut("mobile", suggestion, candidate);
             if (!result.toDict.additions) result.toDict.additions = [];
             result.toDict.additions.push({ name: "原形", value: suggestion });
             suggestion = "";
