@@ -7,3 +7,5 @@ docs/dev-plans/
 tests/*-verification.json
 dist/*.bobplugin
 !dist/eudic-online-0.7.0.bobplugin
+
+!dist/eudic-online-0.8.0.bobplugin

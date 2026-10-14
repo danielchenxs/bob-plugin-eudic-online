@@ -157,12 +157,12 @@ test('桌面建议经原形词条时态验证后加入原形，英英与例句�
     plugin.translate({ text: 'embedding', onCompletion(value) { result = value.result; } });
     requests[0].handler({ response: { statusCode: 200 }, data: embedding + embeddingEnglish });
     requests[1].handler({ response: { statusCode: 200 }, data: '<div class="spellHint">您是否要查找：<a href="/dicts/search/embed">embed</a></div>' });
-    assert.equal(requests.length, 3);
-    assert.equal(requests[2].url, 'https://dict.eudic.net/mdicts/en/embed');
-    assert.equal(requests[2].timeout, 3);
-    requests[2].handler({ response: { statusCode: 200 }, data: embed });
-    assert.match(requests[3].url, /en\.wiktionary\.org\/w\/api\.php/);
-    requests[3].handler({ error: { message: 'timeout' } });
+    assert.equal(requests.length, 4);
+    const candidate = requests.find((item) => item.url === 'https://dict.eudic.net/mdicts/en/embed');
+    const wiki = requests.find((item) => /en\.wiktionary\.org\/w\/api\.php/.test(item.url));
+    assert.equal(candidate.timeout, 3);
+    candidate.handler({ response: { statusCode: 200 }, data: embed });
+    wiki.handler({ error: { message: 'timeout' } });
     assert.deepEqual(result.toDict.additions, [{ name: '原形', value: 'embed' }]);
     assert.doesNotMatch(result.content.text, /建议查找/);
     assert.deepEqual(result.toDict.parts, [{ part: '', means: ['埋入,埋藏'] }]);
@@ -184,8 +184,9 @@ test('错误或未含查询词的候选不伪造原形，候选失败保留建�
       plugin.translate({ text: 'embedding', onCompletion(value) { result = value.result; } });
       requests[0].handler({ response: { statusCode: 200 }, data: embedding + embeddingEnglish });
       requests[1].handler({ response: { statusCode: 200 }, data: '<div class="spellHint"><a>embed</a></div>' });
-      requests[2].handler(candidate === null ? { error: { message: 'timeout' } } : { response: { statusCode: 200 }, data: candidate });
-      requests[3].handler({ error: { message: 'timeout' } });
+      requests.find((item) => item.url === 'https://dict.eudic.net/mdicts/en/embed')
+        .handler(candidate === null ? { error: { message: 'timeout' } } : { response: { statusCode: 200 }, data: candidate });
+      requests.find((item) => /en\.wiktionary\.org\/w\/api\.php/.test(item.url)).handler({ error: { message: 'timeout' } });
       assert.equal(result.toDict.additions, undefined);
       assert.match(result.content.text, /建议查找：\[embed\]/);
       assert.match(result.content.text, /A representation of a unit of text.*as a vector/);

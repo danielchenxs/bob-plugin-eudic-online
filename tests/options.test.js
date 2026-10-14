@@ -12,17 +12,20 @@ const page = `<h2 class="word"><span class="word">hello</span><span class="affil
 <div id="SPECchild"><p id="phrase"><a>hello world</a><br>你好世界</p></div>
 <div id="TingLijuchild">${examples}</div>`;
 
-test('Bob 服务设置恰有六个原生菜单且默认值合法', () => {
-  assert.equal(info.version, '0.7.0');
+test('Bob 服务设置保留六个原生菜单并新增自动同步配置', () => {
+  assert.equal(info.version, '0.8.0');
   assert.deepEqual(info.options.map((item) => item.identifier), [
-    'pronunciation', 'showEnglish', 'showEtymology', 'showForms', 'showPhrases', 'exampleCount'
+    'pronunciation', 'showEnglish', 'showEtymology', 'showForms', 'showPhrases', 'exampleCount',
+    'autoAdd', 'eudicAuthorization', 'wordbookId'
   ]);
-  assert.deepEqual(info.options.map((item) => item.defaultValue), ['both', 'on', 'on', 'on', 'on', '4']);
-  for (const item of info.options) {
+  assert.deepEqual(info.options.map((item) => item.defaultValue), ['both', 'on', 'on', 'on', 'on', '4', 'off', '', '0']);
+  for (const item of info.options.filter((item) => item.type === 'menu')) {
     assert.equal(item.type, 'menu');
     assert.ok(item.menuValues.some((value) => value.value === item.defaultValue));
     assert.ok(item.menuValues.every((value) => typeof value.title === 'string' && typeof value.value === 'string'));
   }
+  assert.equal(info.options.find((item) => item.identifier === 'eudicAuthorization').textConfig.type, 'secure');
+  assert.equal(info.options.find((item) => item.identifier === 'wordbookId').textConfig.type, 'visible');
 });
 
 test('默认内容、中文词性、音频与各设置的局部切换', () => {

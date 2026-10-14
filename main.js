@@ -1,4 +1,4 @@
-/* global $http, $option */
+/* global $http, $option, $file, $data, $timer */
 
 var DICTIONARY_URL = "https://dict.eudic.net/dicts/en/";
 var MOBILE_URL = "https://dict.eudic.net/mdicts/en/";
@@ -6,6 +6,18 @@ var EXAMPLES_URL = "https://dict.eudic.net/liju/en/";
 var SPEECH_URL = "https://api.frdic.com/api/v2/speech/speakweb?";
 var WIKTIONARY_API = "https://en.wiktionary.org/w/api.php?action=parse&prop=text&format=json&redirects=1&page=";
 var WIKTIONARY_PAGE = "https://en.wiktionary.org/wiki/";
+var WORDBOOK_URL = "https://api.frdic.com/api/open/v1/studylist/words";
+var CATEGORY_URL = "https://api.frdic.com/api/open/v1/studylist/category?language=en";
+var PUBLIC_TTL = { mobile: 86400000, desktop: 86400000, wiki: 604800000 };
+var PUBLIC_LIMIT = 200;
+var PUBLIC_FILE_CHARS = 2000000;
+var PUBLIC_FILE_BYTES = 2400000;
+var CACHE_VERSION = 1;
+var cacheMemory = {};
+var ledgerMemory = null;
+var blockedAccounts = null;
+var rateMemory = null;
+var pendingAdds = {};
 
 function normalizeOptions(source) {
   var values = source && typeof source === "object" ? source : {};
@@ -19,7 +31,11 @@ function normalizeOptions(source) {
     showEtymology: pick("showEtymology", ["on", "off"], "on"),
     showForms: pick("showForms", ["on", "off"], "on"),
     showPhrases: pick("showPhrases", ["on", "off"], "on"),
-    exampleCount: pick("exampleCount", ["0", "1", "2", "4"], "4")
+    exampleCount: pick("exampleCount", ["0", "1", "2", "4"], "4"),
+    autoAdd: pick("autoAdd", ["off", "on"], "off"),
+    eudicAuthorization: typeof values.eudicAuthorization === "string" && !/[\r\n]/.test(values.eudicAuthorization)
+      ? values.eudicAuthorization.trim() : "",
+    wordbookId: typeof values.wordbookId === "string" ? values.wordbookId.trim() : "0"
   };
 }
 
@@ -453,35 +469,390 @@ function isLookup(text) {
   return /^[A-Za-z][A-Za-z'’.-]*(?:[ -][A-Za-z][A-Za-z'’.-]*){0,5}$/.test(text) && text.length <= 80;
 }
 
-function loadWiktionary(word, cancelSignal, callback) {
-  function request(page, timeout, complete) {
-    try { $http.request({
-      method: "GET",
-      url: WIKTIONARY_API + encodeURIComponent(page.toLowerCase()),
-      header: { "Accept": "application/json" },
-      timeout: timeout,
-      cancelSignal: cancelSignal,
-      handler: function (response) {
-        var parsed = null;
-        if (!response.error && response.response && response.response.statusCode === 200) {
-          try { parsed = parseWiktionary(response.data, page); } catch (ignored) { parsed = null; }
-        }
-        complete(parsed);
-      }
-    }); } catch (ignored) { complete(null); }
+function storageAvailable() {
+  return typeof $file !== "undefined" && typeof $data !== "undefined"
+    && typeof $file.read === "function" && typeof $file.write === "function";
+}
+
+function readStore(path) {
+  if (!storageAvailable()) return null;
+  try {
+    var data = $file.read(path);
+    if (!data || typeof data.toUTF8 !== "function") return null;
+    var text = data.toUTF8();
+    return typeof text === "string" && text.length <= PUBLIC_FILE_CHARS
+      && (typeof data.length !== "number" || data.length <= PUBLIC_FILE_BYTES) ? JSON.parse(text) : null;
+  } catch (ignored) { return null; }
+}
+
+function writeStore(path, value) {
+  if (!storageAvailable()) return;
+  try { $file.write({ path: path, data: $data.fromUTF8(JSON.stringify(value)) }); }
+  catch (ignored) { /* 缓存不可写时仍可查词 */ }
+}
+
+function validCacheValue(kind, value) {
+  if (kind === "wiki") return !!value && typeof value === "object" && typeof value.title === "string"
+    && value.title.length <= 80 && Array.isArray(value.entries) && value.entries.length <= 3
+    && value.entries.every(function (entry) {
+      return entry && typeof entry.id === "string" && typeof entry.text === "string"
+        && entry.text.length <= 2000 && (!entry.formation || (Array.isArray(entry.formation.items)
+          && entry.formation.items.length === 2 && entry.formation.items.every(function (item) { return typeof item === "string"; })
+          && typeof entry.formation.stem === "string"));
+    }) && (!value.secondary || (typeof value.secondary.title === "string"
+      && typeof value.secondary.id === "string" && value.secondary.formation
+      && Array.isArray(value.secondary.formation.items) && value.secondary.formation.items.length === 2));
+  return typeof value === "string" && value.length > 0 && value.length <= 600000;
+}
+
+function utf8Length(text) {
+  var bytes = 0;
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i);
+    if (code < 0x80) bytes++;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length
+      && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) { bytes += 4; i++; }
+    else bytes += 3;
   }
-  request(word, 5, function (primary) {
+  return bytes;
+}
+
+function cacheBucket(kind) {
+  if (!storageAvailable()) return null;
+  if (cacheMemory[kind]) return cacheMemory[kind];
+  var disk = readStore("$sandbox/eudic-public-" + kind + ".json");
+  var entries = disk && disk.version === CACHE_VERSION && disk.entries && typeof disk.entries === "object"
+    && !Array.isArray(disk.entries) ? disk.entries : {};
+  var now = Date.now();
+  var cleaned = Object.create(null);
+  Object.keys(entries).slice(0, PUBLIC_LIMIT * 2).forEach(function (key) {
+    var item = entries[key];
+    if (item && typeof item.time === "number" && item.time <= now && now - item.time < PUBLIC_TTL[kind]
+      && validCacheValue(kind, item.value)) cleaned[key] = item;
+  });
+  Object.keys(cleaned).sort(function (a, b) { return cleaned[b].time - cleaned[a].time; })
+    .slice(PUBLIC_LIMIT).forEach(function (key) { delete cleaned[key]; });
+  cacheMemory[kind] = cleaned;
+  return cleaned;
+}
+
+function cacheGet(kind, word) {
+  var bucket = cacheBucket(kind);
+  var key = word.toLowerCase();
+  var item = bucket && Object.prototype.hasOwnProperty.call(bucket, key) ? bucket[key] : null;
+  if (!item) return null;
+  if (Date.now() - item.time >= PUBLIC_TTL[kind]) { delete bucket[key]; return null; }
+  if (kind === "wiki" && item.value.title.toLowerCase() !== key) { delete bucket[key]; return null; }
+  if (kind === "desktop" && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(item.value)
+    && !/<h2\b[^>]*class=["'][^"']*word/i.test(item.value)) { delete bucket[key]; return null; }
+  if (kind === "mobile") {
+    var head = extractElement(item.value, "h2", "class", "word");
+    var match = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(head);
+    if (!match || decodeEntities(match[1]).trim().toLowerCase() !== key
+      || !extractElement(item.value, "div", "id", "FCchild")) { delete bucket[key]; return null; }
+  }
+  return item.value;
+}
+
+function cachePut(kind, word, value) {
+  if (!validCacheValue(kind, value)) return;
+  var bucket = cacheBucket(kind);
+  if (!bucket) return;
+  bucket[word.toLowerCase()] = { time: Date.now(), value: value };
+  var keys = Object.keys(bucket).sort(function (a, b) { return bucket[b].time - bucket[a].time; });
+  keys.slice(PUBLIC_LIMIT).forEach(function (key) { delete bucket[key]; });
+  keys = keys.slice(0, PUBLIC_LIMIT);
+  var serialized = JSON.stringify({ version: CACHE_VERSION, entries: bucket });
+  var chars = serialized.length;
+  var bytes = utf8Length(serialized);
+  while (keys.length && (chars > PUBLIC_FILE_CHARS || bytes > PUBLIC_FILE_BYTES)) {
+    var oldKey = keys.pop();
+    var fragment = JSON.stringify(oldKey) + ":" + JSON.stringify(bucket[oldKey]);
+    var comma = keys.length ? 1 : 0;
+    chars -= fragment.length + comma;
+    bytes -= utf8Length(fragment) + comma;
+    delete bucket[oldKey];
+  }
+  serialized = JSON.stringify({ version: CACHE_VERSION, entries: bucket });
+  while (keys.length && (serialized.length > PUBLIC_FILE_CHARS || utf8Length(serialized) > PUBLIC_FILE_BYTES)) {
+    delete bucket[keys.pop()];
+    serialized = JSON.stringify({ version: CACHE_VERSION, entries: bucket });
+  }
+  writeStore("$sandbox/eudic-public-" + kind + ".json", { version: CACHE_VERSION, entries: bucket });
+}
+
+function requestPublic(kind, word, timeout, cancelSignal, callback, isActive) {
+  var saved = cacheGet(kind, word);
+  if (saved) { callback(saved); return; }
+  var url = kind === "mobile" ? MOBILE_URL + encodeURIComponent(word)
+    : kind === "desktop" ? DICTIONARY_URL + encodeURIComponent(word)
+      : WIKTIONARY_API + encodeURIComponent(word.toLowerCase());
+  var once = false;
+  function complete(value) { if (once) return; once = true; callback(value); }
+  try { $http.request({
+    method: "GET", url: url, header: { "Accept": kind === "wiki" ? "application/json" : "text/html" },
+    timeout: timeout, cancelSignal: cancelSignal,
+    handler: function (response) {
+      if (once || (isActive && !isActive())) return;
+      var value = null;
+      if (response && !response.error && response.response && response.response.statusCode === 200) {
+        if (kind === "wiki") {
+          try { value = parseWiktionary(response.data, word); } catch (ignored) { value = null; }
+        } else if (typeof response.data === "string") value = response.data;
+      }
+      var cacheable = !!value;
+      if (kind === "mobile" && value) {
+        var head = extractElement(value, "h2", "class", "word");
+        var shown = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(head);
+        if (!shown || decodeEntities(shown[1]).trim().toLowerCase() !== word.toLowerCase()
+          || !extractElement(value, "div", "id", "FCchild")) cacheable = false;
+      }
+      if (kind === "desktop" && value && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(value)
+        && !/<h2\b[^>]*class=["'][^"']*word/i.test(value)) cacheable = false;
+      if (cacheable && kind !== "mobile") cachePut(kind, word, value);
+      complete(value);
+    }
+  }); } catch (ignored) { complete(null); }
+}
+
+function loadWiktionary(word, cancelSignal, callback, isActive) {
+  requestPublic("wiki", word, 5, cancelSignal, function (primary) {
     if (!primary) { callback(null); return; }
+    primary = JSON.parse(JSON.stringify(primary));
     var formation = primary.entries.length === 1 && primary.entries[0].formation;
     var stem = formation && formation.stem;
     if (!stem || stem.toLowerCase() === word.toLowerCase()) { callback(primary); return; }
-    request(stem, 3, function (secondary) {
+    requestPublic("wiki", stem, 3, cancelSignal, function (secondary) {
       if (secondary && secondary.entries.length === 1 && secondary.entries[0].formation) {
         primary.secondary = { title: secondary.title, id: secondary.entries[0].id, formation: secondary.entries[0].formation };
       }
       callback(primary);
-    });
+    }, isActive);
+  }, isActive);
+}
+
+function authorizationHash(authorization) {
+  try { return require("crypto-js").SHA256(authorization).toString(); }
+  catch (ignored) {
+    try { return require("node:crypto").createHash("sha256").update(authorization).digest("hex"); }
+    catch (ignoredAgain) { return ""; }
+  }
+}
+
+function ledger() {
+  if (ledgerMemory) return ledgerMemory;
+  var disk = readStore("$sandbox/eudic-private-ledger.json");
+  var now = Date.now();
+  var entries = disk && disk.version === CACHE_VERSION && disk.entries && typeof disk.entries === "object"
+    && !Array.isArray(disk.entries) ? disk.entries : {};
+  ledgerMemory = {};
+  Object.keys(entries).slice(0, 1000).forEach(function (key) {
+    var time = entries[key];
+    if (/^[a-f0-9]{64}\|[0-9]+\|[a-z][a-z'’ .-]{0,79}$/i.test(key)
+      && typeof time === "number" && time <= now && now - time < 86400000) ledgerMemory[key] = time;
   });
+  return ledgerMemory;
+}
+
+function rememberWord(key) {
+  if (!key) return;
+  var entries = ledger();
+  entries[key] = Date.now();
+  var keys = Object.keys(entries).sort(function (a, b) { return entries[b] - entries[a]; });
+  keys.slice(500).forEach(function (item) { delete entries[item]; });
+  writeStore("$sandbox/eudic-private-ledger.json", { version: CACHE_VERSION, entries: entries });
+}
+
+function wordbookConfig(options) {
+  var auth = options.eudicAuthorization;
+  var id = options.wordbookId;
+  return auth && !/[\r\n]/.test(auth) && /^(0|[1-9][0-9]*)$/.test(id)
+    && id.length <= 32 ? { authorization: auth, id: id, hash: authorizationHash(auth) } : null;
+}
+
+function rateState() {
+  if (rateMemory) return rateMemory;
+  var disk = readStore("$sandbox/eudic-private-rate.json");
+  var source = disk && disk.version === CACHE_VERSION && disk.accounts
+    && typeof disk.accounts === "object" && !Array.isArray(disk.accounts) ? disk.accounts : {};
+  var now = Date.now();
+  rateMemory = Object.create(null);
+  Object.keys(source).slice(0, 20).forEach(function (hash) {
+    var entry = source[hash];
+    if (!/^[a-f0-9]{64}$/.test(hash) || !entry || !Array.isArray(entry.calls)) return;
+    var calls = entry.calls.filter(function (time) {
+      return typeof time === "number" && time <= now && now - time < 1800000;
+    }).slice(-450);
+    var until = typeof entry.until === "number" && entry.until > now && entry.until <= now + 3600000
+      ? entry.until : 0;
+    if (calls.length || until) rateMemory[hash] = { calls: calls, until: until };
+  });
+  return rateMemory;
+}
+
+function persistRate() {
+  var state = rateState();
+  var accounts = Object.create(null);
+  Object.keys(state).filter(function (key) { return /^[a-f0-9]{64}$/.test(key); }).slice(0, 20)
+    .forEach(function (key) { accounts[key] = state[key]; });
+  writeStore("$sandbox/eudic-private-rate.json", { version: CACHE_VERSION, accounts: accounts });
+}
+
+function accountPermit(hash) {
+  var now = Date.now();
+  if (blockedAccounts === null) {
+    var stored = readStore("$sandbox/eudic-private-blocks.json");
+    blockedAccounts = {};
+    if (stored && stored.version === CACHE_VERSION && Array.isArray(stored.hashes)) {
+      stored.hashes.slice(0, 50).forEach(function (value) {
+        if (typeof value === "string" && /^[a-f0-9]{64}$/.test(value)) blockedAccounts[value] = true;
+      });
+    }
+  }
+  if (hash && blockedAccounts[hash]) return false;
+  var state = rateState();
+  var key = hash || "unhashed";
+  var account = state[key];
+  if (!account) {
+    Object.keys(state).forEach(function (item) {
+      var value = state[item];
+      value.calls = value.calls.filter(function (time) { return time <= now && now - time < 1800000; });
+      if (!value.calls.length && value.until <= now) delete state[item];
+    });
+    if (hash && Object.keys(state).filter(function (item) { return item !== "unhashed"; }).length >= 20) return false;
+    account = { calls: [], until: 0 };
+    state[key] = account;
+  }
+  account.calls = account.calls.filter(function (time) { return time <= now && now - time < 1800000; });
+  if (account && account.until > now) return false;
+  var minute = account.calls.filter(function (time) { return now - time < 60000; }).length;
+  if (minute >= 25 || account.calls.length >= 450) return false;
+  account.calls.push(now);
+  if (hash) persistRate();
+  return true;
+}
+
+function accountFailure(hash, status) {
+  var state = rateState();
+  var key = hash || "unhashed";
+  var account = state[key] || { calls: [], until: 0 };
+  var delay = status === 401 && !hash ? Infinity : status === 403 || status === 429 ? 3600000 : 60000;
+  account.until = Date.now() + delay;
+  state[key] = account;
+  if (hash) persistRate();
+  if (status === 401 && hash) {
+    if (blockedAccounts === null) blockedAccounts = {};
+    blockedAccounts[hash] = true;
+    var hashes = Object.keys(blockedAccounts).slice(-50);
+    writeStore("$sandbox/eudic-private-blocks.json", { version: CACHE_VERSION, hashes: hashes });
+  }
+}
+
+function scheduleTimeout(seconds, handler) {
+  if (typeof $timer === "undefined" || typeof $timer.schedule !== "function") return null;
+  try { return $timer.schedule({ interval: seconds, repeats: false, handler: handler }); }
+  catch (ignored) { return null; }
+}
+
+function invalidateTimeout(id) {
+  if (typeof id === "number" && typeof $timer !== "undefined" && typeof $timer.invalidate === "function") {
+    try { $timer.invalidate(id); } catch (ignored) { /* HTTP 自身超时仍有效 */ }
+  }
+}
+
+function addToWordbook(word, options, cancelSignal, isActive, callback) {
+  var config = wordbookConfig(options);
+  if (!config) { callback("请填写欧路 API 授权信息和有效生词本 ID"); return null; }
+  var key = config.hash ? config.hash + "|" + config.id + "|" + word.toLowerCase() : "";
+  if (key && ledger()[key] && Date.now() - ledger()[key] < 86400000) {
+    callback("近期已加入（本机记录）"); return null;
+  }
+  if (key && pendingAdds[key]) { callback("本词正在同步"); return null; }
+  if (!accountPermit(config.hash)) { callback("同步暂缓，请稍后再试"); return null; }
+  if (key) pendingAdds[key] = true;
+  var settled = false;
+  var timer = scheduleTimeout(3, function () {
+    if (settled || !isActive()) return;
+    accountFailure(config.hash, 0);
+    complete("同步网络超时");
+  });
+  function complete(status) {
+    if (settled) return;
+    settled = true;
+    if (key) delete pendingAdds[key];
+    invalidateTimeout(timer);
+    if (isActive()) callback(status);
+  }
+  try { $http.request({
+    method: "POST", url: WORDBOOK_URL, timeout: 3, cancelSignal: cancelSignal,
+    header: { "Authorization": config.authorization, "Content-Type": "application/json" },
+    body: { language: "en", category_id: config.id, words: [word] },
+    handler: function (response) {
+      if (settled || !isActive()) return;
+      var status = response && response.response && response.response.statusCode;
+      if (!response.error && status === 201) {
+        rememberWord(key);
+        complete("已加入欧路生词本");
+      } else {
+        accountFailure(config.hash, status);
+        complete(status === 401 ? "欧路授权失败" : status === 403 || status === 429
+          ? "欧路同步受限，请稍后再试" : "欧路同步失败，请稍后再试");
+      }
+    }
+  }); } catch (ignored) { if (isActive()) accountFailure(config.hash, 0); complete("欧路同步失败，请稍后再试"); }
+  return function () { complete(""); };
+}
+
+function pluginValidate(completion) {
+  var options = normalizeOptions(typeof $option === "undefined" ? null : $option);
+  if (options.autoAdd !== "on") { completion({ result: true }); return; }
+  var config = wordbookConfig(options);
+  if (!config) { completion({ result: false, error: { type: "secretKey", message: "请填写欧路 API 授权信息和有效生词本 ID" } }); return; }
+  if (!accountPermit(config.hash)) { completion({ result: false, error: { type: "api", message: "验证暂缓，请稍后再试" } }); return; }
+  var settled = false;
+  var timer = scheduleTimeout(5, function () { finish(false, "验证超时，请稍后再试"); });
+  function finish(ok, message) {
+    if (settled) return;
+    settled = true;
+    invalidateTimeout(timer);
+    completion(ok ? { result: true } : { result: false, error: { type: "api", message: message } });
+  }
+  try { $http.request({
+    method: "GET", url: CATEGORY_URL, timeout: 5, header: { "Authorization": config.authorization },
+    handler: function (response) {
+      if (settled) return;
+      var status = response && response.response && response.response.statusCode;
+      if (response.error || status !== 200) {
+        accountFailure(config.hash, status);
+        finish(false, status === 401 ? "欧路授权失败" : "欧路验证失败，请稍后再试");
+        return;
+      }
+      try {
+        var payload = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
+        var categories = payload && payload.data;
+        var exists = Array.isArray(categories) && categories.some(function (item) { return item && String(item.id) === String(config.id); });
+        finish(exists, "未找到所选生词本 ID");
+      } catch (ignored) { finish(false, "欧路验证返回异常"); }
+    }
+  }); } catch (ignored) { finish(false, "欧路验证失败，请稍后再试"); }
+}
+
+function previewText(word, result, core, options) {
+  var lines = ["**" + word.replace(/([*_`\[\]])/g, "\\$1") + "**"];
+  var phonetics = result.toDict.phonetics;
+  for (var i = 0; i < phonetics.length; i++) {
+    if (phonetics[i].value) lines.push((phonetics[i].type === "us" ? "美" : "英") + " /" + phonetics[i].value + "/");
+  }
+  lines.push("**英汉释义**");
+  for (var j = 0; j < result.toDict.parts.length; j++) {
+    var part = result.toDict.parts[j];
+    lines.push((part.part ? part.part + " " : "") + part.means.join("；"));
+  }
+  var body = renderContent(word, core.english, null, "", core.phrases, core.examples,
+    core.examplesWarning, Object.assign({}, options, { showEtymology: "off" }));
+  if (body) lines.push(body);
+  return lines.join("\n\n");
 }
 
 function translate(query, completion) {
@@ -489,101 +860,123 @@ function translate(query, completion) {
   if (typeof done !== "function") return;
   var options = normalizeOptions(typeof $option === "undefined" ? null : $option);
   var completed = false;
+  var cancelled = false;
+  var subscription = null;
+  var cancelTasks = [];
+  var signal = query && query.cancelSignal;
+  function active() { return !completed && !cancelled; }
   function finish(value) {
-    if (completed) return;
+    if (!active()) return;
     completed = true;
+    if (subscription && typeof subscription.dispose === "function") subscription.dispose();
     done(value);
+  }
+  if (signal && typeof signal.subscribe === "function") {
+    try { subscription = signal.subscribe(function () {
+      cancelled = true;
+      cancelTasks.forEach(function (cancel) { cancel(); });
+      cancelTasks = [];
+      if (subscription && typeof subscription.dispose === "function") subscription.dispose();
+    }); } catch (ignored) { /* HTTP cancelSignal remains available */ }
   }
   var word = query && typeof query.text === "string" ? query.text.trim().replace(/\s+/g, " ") : "";
   if (!isLookup(word)) {
     finish({ error: { type: "param", message: "请输入英文单词或简短词组" } });
     return;
   }
-  try { $http.request({
-    method: "GET",
-    url: MOBILE_URL + encodeURIComponent(word),
-    header: { "Accept": "text/html" },
-    timeout: 15,
-    cancelSignal: query.cancelSignal,
-    handler: function (response) {
-      if (response.error) {
-        finish({ error: { type: "network", message: "欧路词典连接失败：" + (response.error.message || "网络错误") } });
-        return;
-      }
-      if (!response.response || response.response.statusCode !== 200 || typeof response.data !== "string") {
-        finish({ error: { type: "network", message: "欧路词典返回异常" } });
-        return;
-      }
-      try {
-        var result = parseEntry(response.data, word, options);
-        if (!result) {
-          finish({ error: { type: "notFound", message: "欧路词典未找到该词条" } });
-          return;
-        }
-        var core = result.raw;
-        delete result.raw;
-        function completeResult(suggestion) {
-          function renderAndFinish(etymology) {
-            var text = renderContent(word, core.english, etymology, suggestion,
-              core.phrases, core.examples, core.examplesWarning, options);
-            if (text) result.content = { format: "markdown", text: text };
-            else delete result.content;
-            finish({ result: result });
+  if (!active()) return;
+  requestPublic("mobile", word, 15, signal, function (html) {
+    if (!active()) return;
+    if (!html) { finish({ error: { type: "network", message: "欧路词典连接失败或返回异常" } }); return; }
+    var result;
+    try { result = parseEntry(html, word, options); }
+    catch (error) { finish({ error: { type: "api", message: error.message || "释义解析失败" } }); return; }
+    if (!result) { finish({ error: { type: "notFound", message: "欧路词典未找到该词条" } }); return; }
+    var core = result.raw;
+    delete result.raw;
+    if (query && typeof query.onStream === "function") {
+      try { query.onStream({ from: "en", to: "zh-Hans", content: { format: "markdown", text: previewText(word, result, core, options) } }); }
+      catch (ignored) { /* Bob 仍会收到最终结果 */ }
+    }
+    if (!active()) return;
+    cachePut("mobile", word, html);
+    var pending = 0;
+    var started = false;
+    var suggestion = "";
+    var etymology = null;
+    var syncStatus = "";
+    function branch() {
+      pending++;
+      var called = false;
+      return function () {
+        if (called || !active()) return false;
+        called = true;
+        pending--;
+        if (started && pending === 0) completeResult();
+        return true;
+      };
+    }
+    function completeResult() {
+      if (!active()) return;
+      var text = renderContent(word, core.english, etymology, suggestion,
+        core.phrases, core.examples, core.examplesWarning, options);
+      if (options.autoAdd === "on") text += (text ? "\n\n" : "") + "生词本：" + syncStatus;
+      if (text) result.content = { format: "markdown", text: text };
+      else delete result.content;
+      finish({ result: result });
+    }
+    if (options.showForms === "on") {
+      var formsDone = branch();
+      requestPublic("desktop", word, 5, signal, function (desktop) {
+        if (!active()) return;
+        try { suggestion = desktop ? parseSuggestion(desktop, word) : ""; }
+        catch (ignored) { suggestion = ""; }
+        if (!suggestion) { formsDone(); return; }
+        requestPublic("mobile", suggestion, 3, signal, function (candidate) {
+          if (!active()) return;
+          var verified = false;
+          try { verified = !!candidate && isVerifiedBaseForm(candidate, suggestion, word); }
+          catch (ignored) { verified = false; }
+          if (verified) {
+            cachePut("mobile", suggestion, candidate);
+            if (!result.toDict.additions) result.toDict.additions = [];
+            result.toDict.additions.push({ name: "原形", value: suggestion });
+            suggestion = "";
           }
-          if (options.showEtymology === "on") loadWiktionary(word, query.cancelSignal, renderAndFinish);
-          else renderAndFinish(null);
-        }
-        if (options.showForms === "off") { completeResult(""); return; }
-        try { $http.request({
-          method: "GET",
-          url: DICTIONARY_URL + encodeURIComponent(word),
-          header: { "Accept": "text/html" },
-          timeout: 5,
-          cancelSignal: query.cancelSignal,
-          handler: function (desktopResponse) {
-            var suggestion = "";
-            if (!desktopResponse.error && desktopResponse.response
-              && desktopResponse.response.statusCode === 200 && typeof desktopResponse.data === "string") {
-              try { suggestion = parseSuggestion(desktopResponse.data, word); } catch (ignored) { suggestion = ""; }
-            }
-            if (!suggestion) { completeResult(""); return; }
-            function finishSuggestion(verified) {
-              if (verified) {
-                if (!result.toDict.additions) result.toDict.additions = [];
-                result.toDict.additions.push({ name: "原形", value: suggestion });
-              }
-              completeResult(verified ? "" : suggestion);
-            }
-            try { $http.request({
-              method: "GET",
-              url: MOBILE_URL + encodeURIComponent(suggestion),
-              header: { "Accept": "text/html" },
-              timeout: 3,
-              cancelSignal: query.cancelSignal,
-              handler: function (candidateResponse) {
-                var verified = false;
-                if (!candidateResponse.error && candidateResponse.response
-                  && candidateResponse.response.statusCode === 200 && typeof candidateResponse.data === "string") {
-                  try { verified = isVerifiedBaseForm(candidateResponse.data, suggestion, word); }
-                  catch (ignored) { verified = false; }
-                }
-                finishSuggestion(verified);
-              }
-            }); } catch (ignored) { finishSuggestion(false); }
-          }
-        }); } catch (ignored) { completeResult(""); }
-      } catch (error) {
-        finish({ error: { type: "api", message: error.message || "释义解析失败" } });
+          formsDone();
+        }, active);
+      }, active);
+    }
+    if (options.showEtymology === "on") {
+      var wikiDone = branch();
+      loadWiktionary(word, signal, function (value) {
+        if (!active()) return;
+        etymology = value;
+        wikiDone();
+      }, active);
+    }
+    if (options.autoAdd === "on") {
+      var syncDone = branch();
+      var stopSync = addToWordbook(word, options, signal, active, function (value) {
+        if (!active()) return;
+        syncStatus = value;
+        syncDone();
+      });
+      if (stopSync) {
+        if (cancelled) stopSync();
+        else cancelTasks.push(stopSync);
       }
     }
-  }); } catch (error) {
-    finish({ error: { type: "network", message: "欧路词典连接失败：" + (error.message || "网络错误") } });
-  }
+    started = true;
+    if (pending === 0) completeResult();
+  }, active);
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { supportLanguages: supportLanguages, translate: translate, parseEntry: parseEntry,
     parsePhonetics: parsePhonetics, parseExamples: parseExamples, parsePhrases: parsePhrases,
     parseWiktionary: parseWiktionary, renderEtymology: renderEtymology,
-    htmlToMarkdown: htmlToMarkdown, isLookup: isLookup };
+    htmlToMarkdown: htmlToMarkdown, isLookup: isLookup, pluginValidate: pluginValidate,
+    _resetForTests: function () { cacheMemory = {}; ledgerMemory = null; blockedAccounts = null;
+      rateMemory = null; pendingAdds = {}; } };
 }
