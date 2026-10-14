@@ -1,6 +1,11 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
 const plugin = require('../main.js');
+const eludesPage = fs.readFileSync(path.join(__dirname, 'fixtures', 'eludes-mobile.html'), 'utf8');
+const happierPage = fs.readFileSync(path.join(__dirname, 'fixtures', 'happier-mobile.html'), 'utf8');
+const childrenPage = fs.readFileSync(path.join(__dirname, 'fixtures', 'children-mobile.html'), 'utf8');
 
 const hello = `<h2 class="word"><span class="word">hello</span><span class="affiliate"><a data-rel="langid=en&txt=aGVsbG8"><uk>/həˈləʊ/</uk><us>/həˈloʊ/</us></a></span></h2><div id="FCchild"><ol><li>int. 喂；哈罗</li></ol></div><div id="FFchild"><div class="exp"><span class="cara">n.</span><ol><li>a greeting</li></ol></div></div>`;
 const embed = `<h2 class="word"><span class="word">embed</span></h2><div id="FCchild">vt. 嵌入<div id="trans"><span class="txtDisabled">时态:</span><span class="trans">embedded, embedding, embeds</span></div></div>`;
@@ -411,4 +416,98 @@ test('30 分钟窗口保守 450 次上限在重载后维持，到边界恢复', 
     assert.equal(env.requests.length, 1);
     respond(env.requests[0], { data: [{ id: '0' }] });
   } finally { Date.now = originalNow; env.restore(); }
+});
+
+test('真实 eludes 页列出的三种时态均可查，原形一次且查询词音频不替换', () => {
+  for (const word of ['eludes', 'eluded', 'eluding']) {
+    const entry = plugin.parseEntry(eludesPage, word);
+    assert.ok(entry);
+    assert.equal(entry.toDict.word, word);
+    assert.deepEqual(entry.toDict.parts, [{ part: 'vt.', means: ['逃避，躲避'] }]);
+    assert.equal(entry.toDict.additions.filter((item) => item.name === '原形').length, 1);
+    assert.equal(entry.toDict.additions.find((item) => item.name === '原形').value, 'elude');
+    assert.match(entry.content.text, /escape, either physically or mentally/);
+    assert.match(entry.content.text, /Lost Girl S02/);
+  }
+  const current = plugin.parseEntry(eludesPage, 'eludes');
+  assert.deepEqual(current.toDict.phonetics.map((item) => item.type), ['us', 'uk']);
+  assert.ok(current.toDict.phonetics.every((item) => item.tts.value.includes('txt=QYNZWx1ZGVz')));
+  const hidden = plugin.parseEntry(eludesPage, 'ELUDES', { showForms: 'off' });
+  assert.ok(hidden);
+  assert.equal(hidden.toDict.additions, undefined);
+});
+
+test('只有 FCchild 的合法变形标签能证明别名，词组空格与大小写规范化', () => {
+  const plural = '<h2 class="word"><span class="word">cat</span></h2><div id="FCchild">n. 猫<div id="trans"><span class="txtDisabled">复 数:</span><span class="trans">cats, cat variants</span></div></div>';
+  assert.ok(plugin.parseEntry(plural, 'CATS'));
+  assert.ok(plugin.parseEntry(plural, 'cat   variants'));
+  const comparison = '<h2 class="word"><span class="word">careful</span></h2><div id="FCchild">adj. 小心的<div id="trans"><span class="txtDisabled">比较级:</span><span class="trans">more careful</span><span class="txtDisabled">最高级:</span><span class="trans">most careful</span></div></div>';
+  assert.ok(plugin.parseEntry(comparison, 'MORE   careful'));
+  assert.ok(plugin.parseEntry(comparison, 'most careful'));
+  assert.equal(plugin.parseEntry(comparison, 'carefully'), null);
+  const onlyDerived = eludesPage.replace('时 态:', '名 词:');
+  assert.equal(plugin.parseEntry(onlyDerived, 'eludes'), null);
+  const onlySuggestion = eludesPage.replace('eluded, eluding, eludes', 'eluded, eluding')
+    .replace('</section>', '<div class="spellHint"><a>eludes</a></div></section>');
+  assert.equal(plugin.parseEntry(onlySuggestion, 'eludes'), null);
+  assert.equal(plugin.parseEntry(eludesPage, 'eludess'), null);
+  assert.equal(plugin.parseEntry(eludesPage.replace('eluded, eluding, eludes', 'eluded, eluding'), 'eludes'), null);
+  assert.equal(plugin.parseEntry(eludesPage.replace('<span class="word">elude</span>', '<span class="word">wrong</span>')
+    .replace('eluded, eluding, eludes', 'wrongs'), 'eludes'), null);
+});
+
+test('eludes 核心成功跳过 desktop 原形请求，最终字典及 POST 仍用原查询词', () => {
+  const env = setup({ showForms: 'on', showEtymology: 'off', autoAdd: 'on', eudicAuthorization: 'fake token', wordbookId: '0' });
+  try {
+    const out = begin(env, 'eludes');
+    respond(env.requests[0], eludesPage);
+    assert.equal(out.stream.length, 1);
+    assert.equal(env.requests.length, 2);
+    assert.equal(env.requests[1].method, 'POST');
+    assert.deepEqual(env.requests[1].body.words, ['eludes']);
+    respond(env.requests[1], {}, 201);
+    assert.equal(out.final.length, 1);
+    assert.equal(out.final[0].result.toDict.word, 'eludes');
+    assert.deepEqual(out.final[0].result.toDict.additions.filter((item) => item.name === '原形'), [{ name: '原形', value: 'elude' }]);
+    assert.match(out.final[0].result.content.text, /eudic:\/\/dict\/eludes/);
+  } finally { env.restore(); }
+});
+
+test('eludes 别名页二查与沙盒重载均命中移动页缓存；未证实页不缓存或同步', () => {
+  const env = setup({ showForms: 'off', showEtymology: 'off' }, true);
+  try {
+    const first = begin(env, 'eludes');
+    respond(env.requests[0], eludesPage);
+    assert.equal(first.final.length, 1);
+    const second = begin(env, 'eludes');
+    assert.equal(second.final.length, 1);
+    assert.equal(env.requests.length, 1);
+    plugin._resetForTests();
+    const third = begin(env, 'eludes');
+    assert.equal(third.final.length, 1);
+    assert.equal(env.requests.length, 1);
+  } finally { env.restore(); }
+  const bad = setup({ showForms: 'off', showEtymology: 'off', autoAdd: 'on', eudicAuthorization: 'fake token', wordbookId: '0' }, true);
+  try {
+    const out = begin(bad, 'eludess');
+    respond(bad.requests[0], eludesPage);
+    assert.equal(out.final[0].error.type, 'notFound');
+    assert.equal(bad.requests.length, 1);
+    assert.equal(bad.disk['$sandbox/eudic-public-mobile.json'], undefined);
+  } finally { bad.restore(); }
+});
+
+test('真实 happier 词形列表只接受比较级，children 精确词头无需 trans', () => {
+  for (const word of ['happier', 'happiest']) {
+    const entry = plugin.parseEntry(happierPage, word);
+    assert.ok(entry);
+    assert.equal(entry.toDict.word, word);
+    assert.deepEqual(entry.toDict.additions.filter((item) => item.name === '原形'), [{ name: '原形', value: 'happy' }]);
+  }
+  assert.equal(plugin.parseEntry(happierPage, 'happily'), null);
+  assert.equal(plugin.parseEntry(happierPage, 'happiness'), null);
+  const children = plugin.parseEntry(childrenPage, 'children');
+  assert.ok(children);
+  assert.equal(children.toDict.parts[0].means[0], '孩子们（child的复数）');
+  assert.equal(children.toDict.additions, undefined);
 });

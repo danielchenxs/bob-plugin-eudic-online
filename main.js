@@ -252,20 +252,41 @@ function parseSuggestion(html, word) {
   return suggested && suggested.toLowerCase() !== word.toLowerCase() && isLookup(suggested) ? suggested : "";
 }
 
-function isVerifiedBaseForm(html, candidate, word) {
-  var header = extractElement(html, "h2", "class", "word");
-  var headword = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(header);
-  if (!headword || decodeEntities(headword[1]).trim().toLowerCase() !== candidate.toLowerCase()) return false;
-  var section = extractElement(html, "div", "id", "FCchild");
+function normalizeLookupWord(text) {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function listedInflection(section, word) {
+  var labels = { "时态": true, "复数": true, "比较级": true, "最高级": true,
+    "过去式": true, "过去分词": true, "现在分词": true, "第三人称单数": true };
+  var expected = normalizeLookupWord(word);
   var forms = parseForms(section);
   for (var i = 0; i < forms.length; i++) {
-    if (forms[i].name !== "时态") continue;
-    var words = forms[i].value.split(/[,，;；\s]+/);
-    for (var j = 0; j < words.length; j++) {
-      if (words[j].toLowerCase() === word.toLowerCase()) return true;
+    if (!Object.prototype.hasOwnProperty.call(labels, forms[i].name)) continue;
+    var values = forms[i].value.split(/[,，;；]/);
+    for (var j = 0; j < values.length; j++) {
+      if (normalizeLookupWord(values[j]) === expected) return true;
     }
   }
   return false;
+}
+
+function entryIdentity(html, word) {
+  if (!isLookup(word.trim().replace(/\s+/g, " "))) return null;
+  var header = extractElement(html, "h2", "class", "word");
+  var match = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(header);
+  var headword = match ? decodeEntities(match[1]).trim().replace(/\s+/g, " ") : "";
+  if (!isLookup(headword)) return null;
+  var section = extractElement(html, "div", "id", "FCchild");
+  if (!section) return null;
+  var alias = normalizeLookupWord(headword) !== normalizeLookupWord(word);
+  if (alias && !listedInflection(section, word)) return null;
+  return { headword: headword, section: section, alias: alias };
+}
+
+function isVerifiedBaseForm(html, candidate, word) {
+  var identity = entryIdentity(html, candidate);
+  return !!identity && !identity.alias && listedInflection(identity.section, word);
 }
 
 function parsePhrases(html) {
@@ -426,11 +447,9 @@ function renderContent(word, english, etymology, suggestion, phrases, examples, 
 
 function parseEntry(html, word, opts) {
   var options = normalizeOptions(opts);
-  var header = extractElement(html, "h2", "class", "word");
-  var headword = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(header);
-  if (!headword || decodeEntities(headword[1]).trim().toLowerCase() !== word.toLowerCase()) return null;
-  var section = extractElement(html, "div", "id", "FCchild");
-  if (!section) return null;
+  var identity = entryIdentity(html, word);
+  if (!identity) return null;
+  var section = identity.section;
   if (/<img\b/i.test(section)) throw new Error("移动页释义含图片，无法保证文字完整");
   var chinese = parseChineseMeaning(section, options.showForms === "on");
   if (!chinese) return null;
@@ -454,12 +473,19 @@ function parseEntry(html, word, opts) {
   });
   var dict = { word: word, phonetics: phonetics, parts: chinese.parts };
   if (chinese.additions.length) dict.additions = chinese.additions;
+  if (identity.alias && options.showForms === "on") {
+    if (!dict.additions) dict.additions = [];
+    if (!dict.additions.some(function (item) { return item.name === "原形"; })) {
+      dict.additions.push({ name: "原形", value: identity.headword });
+    }
+  }
   var content = renderContent(word, english, null, "", phrases, examples, examplesWarning, options);
   var result = {
     from: "en",
     to: "zh-Hans",
     toDict: dict,
-    raw: { meaning: chinese.meaning, english: english, phrases: phrases, examples: examples, examplesWarning: examplesWarning }
+    raw: { meaning: chinese.meaning, english: english, phrases: phrases, examples: examples,
+      examplesWarning: examplesWarning, resolvedHeadword: identity.alias ? identity.headword : "" }
   };
   if (content) result.content = { format: "markdown", text: content };
   return result;
@@ -547,10 +573,7 @@ function cacheGet(kind, word) {
   if (kind === "desktop" && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(item.value)
     && !/<h2\b[^>]*class=["'][^"']*word/i.test(item.value)) { delete bucket[key]; return null; }
   if (kind === "mobile") {
-    var head = extractElement(item.value, "h2", "class", "word");
-    var match = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(head);
-    if (!match || decodeEntities(match[1]).trim().toLowerCase() !== key
-      || !extractElement(item.value, "div", "id", "FCchild")) { delete bucket[key]; return null; }
+    if (!entryIdentity(item.value, word)) { delete bucket[key]; return null; }
   }
   return item.value;
 }
@@ -603,10 +626,7 @@ function requestPublic(kind, word, timeout, cancelSignal, callback, isActive) {
       }
       var cacheable = !!value;
       if (kind === "mobile" && value) {
-        var head = extractElement(value, "h2", "class", "word");
-        var shown = /<span\b[^>]*class="word"[^>]*>([^<]+)<\/span>/i.exec(head);
-        if (!shown || decodeEntities(shown[1]).trim().toLowerCase() !== word.toLowerCase()
-          || !extractElement(value, "div", "id", "FCchild")) cacheable = false;
+        if (!entryIdentity(value, word)) cacheable = false;
       }
       if (kind === "desktop" && value && !/<div\b[^>]*class=["'][^"']*spellHint/i.test(value)
         && !/<h2\b[^>]*class=["'][^"']*word/i.test(value)) cacheable = false;
@@ -925,7 +945,7 @@ function translate(query, completion) {
       else delete result.content;
       finish({ result: result });
     }
-    if (options.showForms === "on") {
+    if (options.showForms === "on" && !core.resolvedHeadword) {
       var formsDone = branch();
       requestPublic("desktop", word, 5, signal, function (desktop) {
         if (!active()) return;
